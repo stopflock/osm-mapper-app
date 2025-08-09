@@ -11,13 +11,61 @@ import 'package:provider/provider.dart';
 
 import '../app_state.dart';
 import '../services/overpass_service.dart';
+import '../services/offline_area_service.dart';
 import '../models/osm_camera_node.dart';
 import 'debouncer.dart';
 import 'camera_tag_sheet.dart';
 
+// --- Smart marker widget for camera with single/double tap distinction
+class _CameraMapMarker extends StatefulWidget {
+  final OsmCameraNode node;
+  final MapController mapController;
+  const _CameraMapMarker({required this.node, required this.mapController, Key? key}) : super(key: key);
+
+  @override
+  State<_CameraMapMarker> createState() => _CameraMapMarkerState();
+}
+
+class _CameraMapMarkerState extends State<_CameraMapMarker> {
+  Timer? _tapTimer;
+  static const Duration tapTimeout = Duration(milliseconds: 250);
+
+  void _onTap() {
+    _tapTimer = Timer(tapTimeout, () {
+      showModalBottomSheet(
+        context: context,
+        builder: (_) => CameraTagSheet(node: widget.node),
+        showDragHandle: true,
+      );
+    });
+  }
+
+  void _onDoubleTap() {
+    _tapTimer?.cancel();
+    widget.mapController.move(widget.node.coord, widget.mapController.camera.zoom + 1);
+  }
+
+  @override
+  void dispose() {
+    _tapTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: _onTap,
+      onDoubleTap: _onDoubleTap,
+      child: const Icon(Icons.videocam, color: Colors.orange),
+    );
+  }
+}
+
 class MapView extends StatefulWidget {
+  final MapController controller;
   const MapView({
     super.key,
+    required this.controller,
     required this.followMe,
     required this.onUserGesture,
   });
@@ -30,7 +78,7 @@ class MapView extends StatefulWidget {
 }
 
 class _MapViewState extends State<MapView> {
-  final MapController _controller = MapController();
+  late final MapController _controller;
   final OverpassService _overpass = OverpassService();
   final Debouncer _debounce = Debouncer(const Duration(milliseconds: 500));
 
@@ -58,6 +106,9 @@ class _MapViewState extends State<MapView> {
   @override
   void initState() {
     super.initState();
+    // Kick off offline area loading as soon as map loads
+    OfflineAreaService();
+    _controller = widget.controller;
     _initLocation();
   }
 
@@ -136,7 +187,16 @@ class _MapViewState extends State<MapView> {
 
     final zoom = _safeZoom();
 
-    final markers = <Marker>[
+    // Camera markers first, then GPS dot, so blue dot is always on top
+    final markers = <Marker>[ 
+      ..._cameras.map(
+        (n) => Marker(
+          point: n.coord,
+          width: 24,
+          height: 24,
+          child: _CameraMapMarker(node: n, mapController: _controller),
+        ),
+      ),
       if (_currentLatLng != null)
         Marker(
           point: _currentLatLng!,
@@ -144,23 +204,6 @@ class _MapViewState extends State<MapView> {
           height: 16,
           child: const Icon(Icons.my_location, color: Colors.blue),
         ),
-      ..._cameras.map(
-        (n) => Marker(
-          point: n.coord,
-          width: 24,
-          height: 24,
-          child: GestureDetector(
-            onTap: () {
-              showModalBottomSheet(
-                context: context,
-                builder: (_) => CameraTagSheet(node: n),
-                showDragHandle: true, // for better UX on Material3
-              );
-            },
-            child: const Icon(Icons.videocam, color: Colors.orange),
-          ),
-        ),
-      ),
     ];
 
     final overlays = <Polygon>[
@@ -176,8 +219,8 @@ class _MapViewState extends State<MapView> {
         FlutterMap(
           mapController: _controller,
           options: MapOptions(
-            center: _currentLatLng ?? LatLng(37.7749, -122.4194),
-            zoom: 15,
+            initialCenter: _currentLatLng ?? LatLng(37.7749, -122.4194),
+            initialZoom: 15,
             maxZoom: 19,
             onPositionChanged: (pos, gesture) {
               if (gesture) widget.onUserGesture();
@@ -203,6 +246,15 @@ class _MapViewState extends State<MapView> {
             ),
             PolygonLayer(polygons: overlays),
             MarkerLayer(markers: markers),
+            // Built-in scale bar from flutter_map 
+            Scalebar(
+              alignment: Alignment.bottomLeft,
+              padding: EdgeInsets.only(left: 8, bottom: 54), // above attribution
+              textStyle: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
+              lineColor: Colors.black,
+              strokeWidth: 3,
+              // backgroundColor removed in flutter_map >=8 (wrap in Container if needed)
+            ),
           ],
         ),
 
@@ -236,6 +288,31 @@ class _MapViewState extends State<MapView> {
             ),
           ),
 
+        // Zoom indicator, positioned above scale bar
+        Positioned(
+          left: 10,
+          bottom: 92,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.52),
+              borderRadius: BorderRadius.circular(7),
+            ),
+            child: Builder(
+              builder: (context) {
+                final zoom = _controller.camera.zoom;
+                return Text(
+                  'Zoom: ${zoom.toStringAsFixed(2)}',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
         // Attribution overlay
         Positioned(
           bottom: 20,
@@ -278,7 +355,6 @@ class _MapViewState extends State<MapView> {
 
     return Polygon(
       points: [origin, left, right, origin],
-      isFilled: true,
       color: Colors.redAccent.withOpacity(0.25),
       borderColor: Colors.redAccent,
       borderStrokeWidth: 1,
